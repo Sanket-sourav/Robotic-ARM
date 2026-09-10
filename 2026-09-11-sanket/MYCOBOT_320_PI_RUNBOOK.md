@@ -4,6 +4,8 @@
 **Serial interface:** `/dev/ttyAMA0` at `115200` baud  
 **Purpose:** Provide a safe, repeatable procedure for starting, validating, operating, testing, calibrating, recovering, and shutting down this robot.
 
+**Latest implementation update:** 2026-09-11 — deployed and live-tested `/home/er/start_up.py`, added safe recurring J1-latch recovery, persistent JSON reporting, guaranteed serial-port release, and documented the `/home/er/joint_test.py` handoff.
+
 > [!CAUTION]
 > A robot can move unexpectedly and can pinch, strike, trap, or damage people and equipment. Secure the base, keep the workspace clear, keep the emergency-stop switch reachable, and never energize or move the arm when its physical state cannot be observed. Do not configure unattended automatic motor power-on at Linux boot.
 
@@ -20,6 +22,9 @@ The robot and Raspberry Pi are now operational. The original problem was a combi
 7. The operator used the emergency switch and manually placed the arm in a clear upright pose, then released the switch.
 8. After `power_on()`, all controller, servo, voltage, temperature, error, angle, and coordinate checks passed.
 9. Every joint completed a slow relative `+20°` movement and returned to its starting position with zero reported errors.
+10. `/home/er/start_up.py` was replaced with a supervised startup program that powers the controller, validates the physical/controller state, safely clears a stale latch, focuses all servos, records full telemetry, writes a JSON report, and closes the serial port.
+11. A recurring J1 error `1` was observed even while J1 was physically inside `[-168°, 168°]`. The startup program now performs a second J1-specific validation after servo focus and clears that stale latch exactly once only when J1, robot status, and servo status are all safe.
+12. The deployed script completed a live run with `RESULT: READY (exit 0)`, controller error `0`, and clean robot/servo status arrays.
 
 The dependable operating rule is therefore:
 
@@ -295,126 +300,171 @@ Use this only after becoming familiar with the detailed procedure.
 - [ ] Every angle is inside its live configured limit.
 - [ ] Application starts at low speed and verifies feedback.
 
-## 7. Reusable startup health checker
+## 7. Deployed startup program: `/home/er/start_up.py`
 
-Save the following as `/home/er/mycobot_startup_check.py`. It does not move the arm. It powers on only when explicitly invoked with `--power-on`.
+The Raspberry Pi now has an executable startup program at:
+
+```text
+/home/er/start_up.py
+```
+
+The earlier read-only checker was preserved at:
+
+```text
+/home/er/start_up.py.bak-20260911-before-safe-startup
+```
+
+The version immediately before the J1-specific latch improvement was preserved at:
+
+```text
+/home/er/start_up.py.bak-20260911-before-j1-latch-fix
+```
+
+### 7.1 Normal use
+
+Complete the physical preflight, release the emergency stop, wait for the Pi to boot, and run:
+
+```bash
+/home/er/start_up.py
+```
+
+Do not start another robot program unless the final line reports:
+
+```text
+RESULT: READY (exit 0)
+```
+
+The normal run deliberately sends no joint-angle or Cartesian motion command. It may energize and focus the servos, so the arm can lock immediately.
+
+### 7.2 Exact startup sequence implemented
+
+The deployed script performs these operations in order:
+
+1. Opens `/dev/ttyAMA0` at `115200` baud.
+2. Calls `is_power_on()`; if the result is `0`, calls `power_on()` and waits for stabilization.
+3. Requires `is_controller_connected() == 1`.
+4. Requires all six servos to communicate.
+5. Reads all six current joint angles.
+6. Reads every live joint minimum and maximum from the controller.
+7. Refuses to clear errors if any measured angle is outside its configured limits.
+8. Refuses to clear errors if servo hardware status or robot status is nonzero.
+9. If a controller error is merely latched while the validated physical state is safe, calls `stop()` first, clears the error exactly once, and requires the error to remain `0`.
+10. Preserves the existing J1 calibration during normal startup.
+11. Calls `focus_all_servos()` to request holding torque on all joints.
+12. Performs the additional post-focus J1-latch check described below.
+13. Runs a final gate covering power, controller, servo communication, errors, angles, coordinates, limits, voltages, temperatures, currents, and firmware.
+14. Writes a structured report to `/home/er/mycobot_startup_report.json`.
+15. Closes the serial port in a `finally` block, including on failure, so later programs can use it.
+
+### 7.3 Recurring J1 error-1 handling
+
+The robot was observed reporting controller error `1` even when the measured J1 angle was approximately `0.7°`, safely inside the controller's configured J1 range of `-168°` to `168°`. This indicated a stale or re-latched J1 limit warning rather than a current physical over-limit angle.
+
+After `focus_all_servos()`, the script now executes:
 
 ```python
-#!/usr/bin/env python3
-"""Read-only MyCobot 320 Pi health gate, with optional explicit power-on."""
-
-import argparse
-import json
-import sys
-import time
-from pymycobot.mycobot320 import MyCobot320
-
-PORT = "/dev/ttyAMA0"
-BAUD = 115200
-
-
-def six_numbers(value):
-    return (
-        isinstance(value, list)
-        and len(value) == 6
-        and all(isinstance(item, (int, float)) for item in value)
-    )
-
-
-def all_zero(value):
-    return isinstance(value, list) and value and all(item == 0 for item in value)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--power-on",
-        action="store_true",
-        help="Power on the controller after the operator completes physical preflight",
-    )
-    args = parser.parse_args()
-
-    mc = MyCobot320(PORT, BAUD, timeout=1)
-    try:
-        initial_power = mc.is_power_on()
-        if initial_power == 0 and args.power_on:
-            result = mc.power_on()
-            print(f"power_on_result={result}", flush=True)
-            time.sleep(3)
-
-        limits = [
-            [mc.get_joint_min_angle(joint), mc.get_joint_max_angle(joint)]
-            for joint in range(1, 7)
-        ]
-
-        state = {
-            "power": mc.is_power_on(),
-            "controller_connected": mc.is_controller_connected(),
-            "all_servos_enabled": mc.is_all_servo_enable(),
-            "system_version": mc.get_system_version(),
-            "atom_version": mc.get_atom_version(),
-            "error": mc.get_error_information(),
-            "robot_status": mc.get_robot_status(),
-            "next_error": mc.read_next_error(),
-            "servo_status": mc.get_servo_status(),
-            "voltages": mc.get_servo_voltages(),
-            "temperatures": mc.get_servo_temps(),
-            "currents": mc.get_servo_currents(),
-            "angles": mc.get_angles(),
-            "coords": mc.get_coords(),
-            "limits": limits,
-        }
-
-        angles_in_limits = six_numbers(state["angles"]) and all(
-            isinstance(low, (int, float))
-            and isinstance(high, (int, float))
-            and low <= angle <= high
-            for angle, (low, high) in zip(state["angles"], limits)
-        )
-
-        passed = all(
-            [
-                state["power"] == 1,
-                state["controller_connected"] == 1,
-                state["all_servos_enabled"] == 1,
-                state["error"] == 0,
-                all_zero(state["robot_status"]),
-                all_zero(state["next_error"]),
-                all_zero(state["servo_status"]),
-                six_numbers(state["angles"]),
-                six_numbers(state["coords"]),
-                angles_in_limits,
-            ]
-        )
-
-        state["angles_in_limits"] = angles_in_limits
-        state["health_gate_passed"] = passed
-        print(json.dumps(state, indent=2), flush=True)
-        return 0 if passed else 2
-    finally:
-        mc.close()
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+report["post_focus_j1_error"] = clear_safe_j1_limit_latch_after_focus(
+    mc, reporter, preclear["limits"]
+)
 ```
 
-Run it after physical preflight:
+That function:
+
+1. Reads the error immediately after servo focus.
+2. Does nothing when the result is `0`.
+3. Refuses automatic recovery for any error other than J1 limit error `1`.
+4. Reads J1 again and requires it to be within its live configured limits.
+5. Requires all servo hardware and robot status values to remain zero.
+6. Calls `stop()` so an old command cannot resume.
+7. Clears the stale J1 latch once.
+8. Requires error readback to become and remain `0`.
+9. Fails startup if J1 is genuinely outside its limits or the fault immediately returns.
+
+The script does **not** expand J1 limits and does **not** recalibrate an arbitrary pose. Those shortcuts could hide a real mechanical condition.
+
+### 7.4 Why J1 is not calibrated every run
+
+`set_servo_calibration(1)` permanently defines J1's current physical position as `0°`. Automatically calling it at every startup would make whatever position J1 happened to occupy the new zero, corrupting later angles, coordinates, and software-limit behavior.
+
+Normal startup therefore preserves calibration. When J1 is visibly aligned with its physical zero mark and calibration is genuinely required, use both explicit flags:
 
 ```bash
-python3 /home/er/mycobot_startup_check.py --power-on
+/home/er/start_up.py \
+  --calibrate-j1 \
+  --confirm-j1-at-physical-zero
 ```
 
-The command must exit with status `0` and print `"health_gate_passed": true` before motion begins:
+The script refuses `--calibrate-j1` without the physical-zero confirmation flag. Calibration is a maintenance operation, not an error-clearing shortcut.
+
+### 7.5 Reports and exit codes
+
+Every run prints timestamped `STEP`, `OK`, `WARN`, or `FAIL` messages and atomically replaces:
+
+```text
+/home/er/mycobot_startup_report.json
+```
+
+Inspect the most recent report with:
 
 ```bash
-python3 /home/er/mycobot_startup_check.py --power-on
-echo $?
+python3 -m json.tool /home/er/mycobot_startup_report.json
 ```
 
-## 8. Repeatable six-joint ±20° functional test
+| Exit code | Meaning |
+|---:|---|
+| `0` | Final health gate passed; the next supervised script may run |
+| `2` | Controlled safety, limit, controller, or servo failure |
+| `3` | Unexpected Python or serial failure |
+| `4` | Robot passed, but the JSON report could not be written |
+| `130` | Operator interrupted startup |
 
-This is a maintenance/self-check, not something that should run automatically on every Linux boot. Run it only with an operator watching the robot and after the health gate passes.
+The important JSON fields are `ready`, `result`, `exit_code`, `serial_closed`, `events`, `preclear_state`, `post_focus_j1_error`, and `final_state`.
+
+### 7.6 Safe handoff to another program
+
+A subsequent program should start only if startup exits `0`:
+
+```bash
+/home/er/start_up.py && python3 /home/er/your_robot_program.py
+```
+
+For the standard joint test:
+
+```bash
+/home/er/start_up.py && python3 /home/er/joint_test.py
+```
+
+The shell's `&&` prevents the second program from running when startup reports `NOT_READY`. The startup script closes `/dev/ttyAMA0` before it exits, so the second program can open the port normally.
+
+### 7.7 Latest validated startup result
+
+The first deployed version safely cleared a latched J1 error `1`, focused all servos, passed its final checks, wrote valid JSON, and released the serial port. After the J1-specific post-focus improvement, another live run reported:
+
+```text
+J1 angle: 1.05°
+J1 limits: -168.0° to 168.0°
+controller error immediately after servo focus: 0
+robot status: [0, 0, 0, 0, 0, 0]
+queued errors: [0, 0, 0, 0, 0, 0, 0]
+servo status: [0, 0, 0, 0, 0, 0]
+angles: [1.05, 15.02, -19.86, -6.24, 8.61, 53.96]
+coordinates: [5.8, -153.4, 515.2, -92.25, 42.99, -172.02]
+RESULT: READY (exit 0)
+```
+
+The JSON report parsed successfully, and `fuser -v /dev/ttyAMA0` showed no owner after the script exited.
+
+## 8. Repeatable six-joint ±20° functional test: `joint_test.py`
+
+The canonical post-startup joint test is `/home/er/joint_test.py`. This is a maintenance/self-check, not something that should run automatically on every Linux boot. Run it only with an operator watching the robot and only after `/home/er/start_up.py` returns `READY` with exit code `0`.
+
+The intended handoff is:
+
+```bash
+/home/er/start_up.py && python3 /home/er/joint_test.py
+```
+
+If `joint_test.py` is not yet present on a rebuilt Pi, save the implementation below using that exact filename.
 
 The script below:
 
@@ -426,7 +476,7 @@ The script below:
 6. Stops immediately on an error, timeout, or unexpected result.
 7. Requires the operator to type `MOVE` before motion.
 
-Save it as `/home/er/mycobot_joint_test_20deg.py`:
+Save it as `/home/er/joint_test.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -578,7 +628,7 @@ if __name__ == "__main__":
 Run it only while watching the robot:
 
 ```bash
-python3 /home/er/mycobot_joint_test_20deg.py
+python3 /home/er/joint_test.py
 ```
 
 ## 9. Passing test record from this incident
@@ -842,8 +892,8 @@ For repeatability, automate diagnostics but retain a human-controlled transition
 
 1. Boot the Pi and cooling fan automatically.
 2. Perform physical preflight.
-3. Run `mycobot_startup_check.py --power-on` manually.
-4. Require `health_gate_passed: true`.
+3. Run `/home/er/start_up.py` manually.
+4. Require `RESULT: READY (exit 0)` and a report with `"ready": true`.
 5. Start the intended robot application manually or through a supervised operator interface.
 
 If unattended operation is a future requirement, it needs a separate safety design: guarded workspace, interlocks, risk assessment, known homing strategy, startup-state sensing, watchdog behavior, and a tested recovery plan. A systemd unit alone is not sufficient.
@@ -928,5 +978,9 @@ At the end of the documented recovery and test:
 - All six joints passed observed low-speed 20-degree movement and return tests.
 - Angle and Cartesian telemetry were valid.
 - The SSH session remained available for supervised operation.
+- `/home/er/start_up.py` was deployed, backed up, syntax-checked, live-tested, and left executable.
+- Safe recurring J1 error-1 recovery was added after servo focus without changing limits or performing automatic calibration.
+- `/home/er/mycobot_startup_report.json` was validated as JSON, and the serial port was confirmed free after startup.
+- `/home/er/joint_test.py` is the documented canonical test to run only after startup succeeds.
 
 The robot is ready for operation when—and only when—the physical preflight and complete software health gate are repeated successfully for the current run.
